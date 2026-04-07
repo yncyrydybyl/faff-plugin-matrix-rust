@@ -223,24 +223,28 @@ fn fmt_duration(start: DateTime<Tz>, end: DateTime<Tz>) -> String {
 }
 
 /// Render a `{key}`-style template, leaving unknown keys as empty strings.
+///
+/// Walks the template by `&str` slices so multi-byte UTF-8 characters
+/// (emoji, accents, arrows) round-trip correctly. An unmatched opening
+/// brace is left in place verbatim.
 fn render(template: &str, fields: &HashMap<&'static str, String>) -> String {
     let mut out = String::with_capacity(template.len());
-    let bytes = template.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end) = template[i + 1..].find('}') {
-                let key = &template[i + 1..i + 1 + end];
-                if let Some(v) = fields.get(key) {
-                    out.push_str(v);
-                } // unknown keys render as empty
-                i += 1 + end + 1;
-                continue;
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find('}') {
+            let key = &after[..close];
+            if let Some(v) = fields.get(key) {
+                out.push_str(v);
             }
+            rest = &after[close + 1..];
+        } else {
+            out.push_str(&rest[open..]);
+            return out;
         }
-        out.push(bytes[i] as char);
-        i += 1;
     }
+    out.push_str(rest);
     out
 }
 
@@ -544,5 +548,157 @@ async fn main() -> Result<()> {
         Cmd::Run => cmd_run(cfg, store_path).await,
         Cmd::Test => cmd_test(cfg, store_path).await,
         Cmd::Now => cmd_now(cfg, store_path).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono_tz::UTC;
+
+    fn ts(h: u32, m: u32) -> DateTime<Tz> {
+        chrono::NaiveDate::from_ymd_opt(2026, 4, 8)
+            .unwrap()
+            .and_hms_opt(h, m, 0)
+            .unwrap()
+            .and_local_timezone(UTC)
+            .unwrap()
+    }
+
+    fn snap(title: &str, h: u32, m: u32) -> Snapshot {
+        Snapshot {
+            title: title.into(),
+            role: String::new(),
+            impact: String::new(),
+            mode: String::new(),
+            subject: String::new(),
+            trackers: String::new(),
+            start: ts(h, m),
+        }
+    }
+
+    fn fields_with(title: &str) -> HashMap<&'static str, String> {
+        let mut f = HashMap::new();
+        f.insert("title", title.to_string());
+        f
+    }
+
+    // ----- render -----
+
+    #[test]
+    fn render_handles_unicode_in_template() {
+        // Regression for #1: byte-cast version produced mojibake here.
+        assert_eq!(render("▶ {title}", &fields_with("ok")), "▶ ok");
+    }
+
+    #[test]
+    fn render_handles_emoji_in_template() {
+        assert_eq!(render("⏱ {title} 🎯", &fields_with("focus")), "⏱ focus 🎯");
+    }
+
+    #[test]
+    fn render_unknown_keys_become_empty() {
+        assert_eq!(render("[{nope}]", &HashMap::new()), "[]");
+    }
+
+    #[test]
+    fn render_unmatched_open_brace_is_passthrough() {
+        assert_eq!(render("hello {world", &HashMap::new()), "hello {world");
+    }
+
+    #[test]
+    fn render_no_placeholders_is_identity() {
+        assert_eq!(render("plain text", &HashMap::new()), "plain text");
+    }
+
+    #[test]
+    fn render_replaces_multiple_placeholders() {
+        let mut f = HashMap::new();
+        f.insert("a", "1".to_string());
+        f.insert("b", "2".to_string());
+        assert_eq!(render("{a}-{b}", &f), "1-2");
+    }
+
+    // ----- diff -----
+
+    #[test]
+    fn diff_none_to_none_is_no_op() {
+        let templates = templates();
+        assert!(diff(None, None, ts(12, 0), &templates).is_none());
+    }
+
+    #[test]
+    fn diff_none_to_some_is_start() {
+        let templates = templates();
+        let curr = snap("hack", 9, 0);
+        let (kind, _body) = diff(None, Some(&curr), ts(9, 5), &templates).unwrap();
+        assert!(matches!(kind, Transition::Start));
+    }
+
+    #[test]
+    fn diff_some_to_none_is_stop() {
+        let templates = templates();
+        let prev = snap("hack", 9, 0);
+        let (kind, _body) = diff(Some(&prev), None, ts(9, 30), &templates).unwrap();
+        assert!(matches!(kind, Transition::Stop));
+    }
+
+    #[test]
+    fn diff_same_start_is_no_op() {
+        let templates = templates();
+        let prev = snap("hack", 9, 0);
+        let curr = snap("hack", 9, 0);
+        assert!(diff(Some(&prev), Some(&curr), ts(9, 30), &templates).is_none());
+    }
+
+    #[test]
+    fn diff_different_start_is_switch() {
+        let templates = templates();
+        let prev = snap("hack", 9, 0);
+        let curr = snap("review", 10, 0);
+        let (kind, body) = diff(Some(&prev), Some(&curr), ts(10, 5), &templates).unwrap();
+        assert!(matches!(kind, Transition::Switch));
+        assert!(body.contains("hack"));
+        assert!(body.contains("review"));
+    }
+
+    fn templates() -> Templates {
+        Templates {
+            start: "[start] {title}".to_string(),
+            stop: "[stop] {title} ({duration})".to_string(),
+            switch: "[switch] {prev_title} -> {title} ({prev_duration})".to_string(),
+        }
+    }
+
+    // ----- fmt_duration -----
+
+    #[test]
+    fn fmt_duration_minutes_only() {
+        assert_eq!(fmt_duration(ts(9, 0), ts(9, 5)), "5m");
+    }
+
+    #[test]
+    fn fmt_duration_hours_and_minutes() {
+        assert_eq!(fmt_duration(ts(9, 0), ts(11, 30)), "2h30m");
+    }
+
+    #[test]
+    fn fmt_duration_zero() {
+        assert_eq!(fmt_duration(ts(9, 0), ts(9, 0)), "0m");
+    }
+
+    #[test]
+    fn fmt_duration_negative_clamps_to_zero() {
+        // Clock skew between log and now: end < start.
+        assert_eq!(fmt_duration(ts(11, 0), ts(9, 0)), "0m");
+    }
+
+    #[test]
+    fn fmt_duration_pads_minutes_when_hours_present() {
+        assert_eq!(fmt_duration(ts(9, 0), ts(10, 5)), "1h05m");
     }
 }
