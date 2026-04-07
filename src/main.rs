@@ -438,6 +438,12 @@ async fn send_text(room: &Room, body: &str, dry_run: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn read_active_snapshot(ws: &Arc<Workspace>) -> Result<Option<Snapshot>> {
+    // NOTE: this only reads today's log. The Rust core's LogManager
+    // auto-stops yesterday's unclosed sessions when get_log(today) is
+    // first called after midnight, which fires a LogChanged event and
+    // makes the watcher emit a "stop" notification at midnight even
+    // though the user took no action. See #12 — this is currently
+    // accepted behaviour, not a bug to fix here.
     let log = ws.logs().get_log(ws.today()).await?;
     Ok(log.active_session().map(Snapshot::from_session))
 }
