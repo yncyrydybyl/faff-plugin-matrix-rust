@@ -73,6 +73,10 @@ struct RawConnection {
     access_token: Option<String>,
     #[serde(default)]
     access_token_env: Option<String>,
+    #[serde(default)]
+    store_passphrase: Option<String>,
+    #[serde(default)]
+    store_passphrase_env: Option<String>,
     room: String,
 }
 
@@ -95,6 +99,9 @@ struct Config {
     user_id: OwnedUserId,
     device_id: OwnedDeviceId,
     access_token: String,
+    /// Optional passphrase for encrypting the on-disk crypto store.
+    /// `None` leaves the SQLite DB unencrypted on disk.
+    store_passphrase: Option<String>,
     room: String,
     notify_on: HashSet<String>,
     announce_on_startup: bool,
@@ -128,6 +135,19 @@ impl Config {
             )
         })?;
 
+        // Same precedence rules for the optional store passphrase:
+        // env var wins if set and non-empty, otherwise fall back to the
+        // direct value, otherwise None (= unencrypted store).
+        let store_passphrase = match (
+            raw.connection.store_passphrase_env.as_deref(),
+            &raw.connection.store_passphrase,
+        ) {
+            (Some(var), _) if !var.is_empty() => std::env::var(var).ok().filter(|s| !s.is_empty()),
+            _ => None,
+        }
+        .or(raw.connection.store_passphrase.clone())
+        .filter(|s| !s.is_empty());
+
         let user_id = OwnedUserId::try_from(raw.connection.user_id.clone())
             .map_err(|e| anyhow!("invalid user_id {:?}: {}", raw.connection.user_id, e))?;
         let device_id: OwnedDeviceId = raw.connection.device_id.clone().into();
@@ -141,6 +161,7 @@ impl Config {
             user_id,
             device_id,
             access_token: token,
+            store_passphrase,
             room: raw.connection.room,
             notify_on: opts
                 .notify_on
@@ -296,9 +317,19 @@ async fn build_client(cfg: &Config, store_path: &Path) -> Result<Client> {
     fs::create_dir_all(store_path)
         .with_context(|| format!("creating store dir {}", store_path.display()))?;
 
+    // The crypto store holds the bot's Olm identity and Megolm session
+    // keys — anyone with read access can impersonate the bot in
+    // encrypted rooms. Lock it down to the owning user on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(store_path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", store_path.display()))?;
+    }
+
     let client = Client::builder()
         .homeserver_url(&cfg.homeserver)
-        .sqlite_store(store_path, None)
+        .sqlite_store(store_path, cfg.store_passphrase.as_deref())
         .build()
         .await
         .context("building matrix-sdk client")?;
