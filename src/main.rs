@@ -28,6 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -447,14 +448,15 @@ async fn read_active_snapshot(ws: &Arc<Workspace>) -> Result<Option<Snapshot>> {
 
 async fn cmd_test(cfg: Config, store_path: PathBuf) -> Result<()> {
     let client = build_client(&cfg, &store_path).await?;
-    println!(
+    tracing::info!(
         "authenticated as {} (device {})",
-        cfg.user_id, cfg.device_id
+        cfg.user_id,
+        cfg.device_id
     );
 
     first_sync(&client).await?;
     let room_id = resolve_room(&client, &cfg.room).await?;
-    println!("resolved room: {room_id}");
+    tracing::info!("resolved room: {room_id}");
     let room = ensure_member(&client, &room_id).await?;
 
     // Warn if the room has only the bot as a joined member: the probe
@@ -463,8 +465,8 @@ async fn cmd_test(cfg: Config, store_path: PathBuf) -> Result<()> {
     // invitees haven't accepted yet) and worth surfacing loudly.
     let joined = room.joined_members_count();
     if joined <= 1 {
-        eprintln!(
-            "warn: room {room_id} has only the bot user as a joined member. \
+        tracing::warn!(
+            "room {room_id} has only the bot user as a joined member. \
              The probe message will not be decryptable for anyone until other \
              members accept the invite and sync."
         );
@@ -502,15 +504,16 @@ async fn cmd_now(cfg: Config, store_path: PathBuf) -> Result<()> {
 
 async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
     let client = build_client(&cfg, &store_path).await?;
-    eprintln!(
+    tracing::info!(
         "authenticated as {} device {}",
-        cfg.user_id, cfg.device_id
+        cfg.user_id,
+        cfg.device_id
     );
 
     first_sync(&client).await?;
     let room_id = resolve_room(&client, &cfg.room).await?;
     let room = ensure_member(&client, &room_id).await?;
-    eprintln!("posting to {room_id}");
+    tracing::info!("posting to {room_id}");
 
     // Background sync keeps Megolm sessions and member lists current.
     // matrix-sdk's sync() returns on a non-recoverable error (network
@@ -525,8 +528,8 @@ async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
             match bg_client.sync(SyncSettings::default()).await {
                 Ok(()) => break,
                 Err(e) => {
-                    eprintln!(
-                        "warn: background sync stopped: {e}; retrying in {backoff:?}"
+                    tracing::warn!(
+                        "background sync stopped: {e}; retrying in {backoff:?}"
                     );
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
@@ -543,7 +546,7 @@ async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
             if cfg.notify_on.contains("start") {
                 let body = render(&cfg.templates.start, &snap.fields());
                 if let Err(e) = send_text(&room, &body, cfg.dry_run).await {
-                    eprintln!("warn: startup announce failed: {e}");
+                    tracing::warn!("startup announce failed: {e}");
                 }
             }
         }
@@ -554,7 +557,7 @@ async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
         .spawn_event_stream()
         .ok_or_else(|| anyhow!("storage backend does not support event streams"))?;
     let mut rx = stream.subscribe();
-    eprintln!("watching faff workspace for log changes...");
+    tracing::info!("watching faff workspace for log changes...");
 
     // Signal handlers for graceful shutdown. ctrl_c covers SIGINT;
     // SignalKind::terminate covers SIGTERM (systemd 'stop'). We need
@@ -570,7 +573,7 @@ async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
                     let curr = match read_active_snapshot(&ws).await {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("warn: failed to read active session: {e}");
+                            tracing::warn!("failed to read active session: {e}");
                             continue;
                         }
                     };
@@ -579,7 +582,7 @@ async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
                     {
                         if cfg.notify_on.contains(kind.name()) {
                             if let Err(e) = send_text(&room, &body, cfg.dry_run).await {
-                                eprintln!("matrix post failed: {e}");
+                                tracing::error!("matrix post failed: {e}");
                             }
                         }
                     }
@@ -587,29 +590,29 @@ async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
                 }
                 Ok(StorageEvent::PlanChanged(_)) => { /* ignore */ }
                 Err(RecvError::Lagged(n)) => {
-                    eprintln!("warn: event stream lagged, dropped {n} events; resyncing state");
+                    tracing::warn!("event stream lagged, dropped {n} events; resyncing state");
                     // Don't propagate transient read errors here — that
                     // would tear down the watcher on a hiccup. Match
                     // the other read_active_snapshot call site.
                     prev = match read_active_snapshot(&ws).await {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("warn: post-lag resync failed: {e}");
+                            tracing::warn!("post-lag resync failed: {e}");
                             continue;
                         }
                     };
                 }
                 Err(RecvError::Closed) => {
-                    eprintln!("event stream closed");
+                    tracing::warn!("event stream closed");
                     break;
                 }
             },
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("received SIGINT, shutting down");
+                tracing::info!("received SIGINT, shutting down");
                 break;
             }
             _ = sigterm.recv() => {
-                eprintln!("received SIGTERM, shutting down");
+                tracing::info!("received SIGTERM, shutting down");
                 break;
             }
         }
@@ -654,7 +657,13 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Disable ANSI escape codes when stderr isn't a TTY (e.g. piped to
+    // a file or captured by journald). Without this, every log line
+    // gets wrapped in [2m...[0m noise that downstream consumers have
+    // to strip.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,faff_plugin_matrix_rust=info")),
