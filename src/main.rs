@@ -480,7 +480,16 @@ async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
             Ok(StorageEvent::PlanChanged(_)) => { /* ignore */ }
             Err(RecvError::Lagged(n)) => {
                 eprintln!("warn: event stream lagged, dropped {n} events; resyncing state");
-                prev = read_active_snapshot(&ws).await?;
+                // Don't propagate transient read errors here — that would
+                // tear down the watcher on a hiccup. Match the other
+                // read_active_snapshot call site and continue.
+                prev = match read_active_snapshot(&ws).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("warn: post-lag resync failed: {e}");
+                        continue;
+                    }
+                };
             }
             Err(RecvError::Closed) => {
                 eprintln!("event stream closed");
