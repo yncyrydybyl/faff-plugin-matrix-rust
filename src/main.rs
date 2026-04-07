@@ -352,7 +352,49 @@ async fn build_client(cfg: &Config, store_path: &Path) -> Result<Client> {
         .await
         .context("restoring matrix session (check user_id/device_id/access_token triple)")?;
 
+    // Sanity-check the (user_id, device_id) pair against the server.
+    // restore_session itself will happily accept any triple, but if the
+    // device_id doesn't match the one MAS issued the token for, Megolm
+    // key sharing will silently fail and messages will be undecryptable
+    // for everyone in the room. Catch this at startup with a clear
+    // error instead of leaving the user to debug missing decryption.
+    let who = client
+        .whoami()
+        .await
+        .context("whoami after restore_session")?;
+    if who.user_id != cfg.user_id {
+        bail!(
+            "config user_id ({}) does not match server ({})",
+            cfg.user_id,
+            who.user_id
+        );
+    }
+    if let Some(device_id) = who.device_id.as_ref() {
+        if device_id != &cfg.device_id {
+            bail!(
+                "config device_id ({}) does not match server ({})",
+                cfg.device_id,
+                device_id
+            );
+        }
+    }
+
     Ok(client)
+}
+
+/// Run the first sync from a fresh (or restored) crypto store.
+///
+/// `full_state(true)` is critical here: it makes matrix-sdk fetch the
+/// complete member list of every joined room, so that when the bot
+/// builds a Megolm session it shares with every device in the room.
+/// Skipping it on the very first sync of a fresh store can lead to
+/// silently undecryptable messages for some members.
+async fn first_sync(client: &Client) -> Result<()> {
+    client
+        .sync_once(SyncSettings::default().full_state(true))
+        .await
+        .context("initial sync")?;
+    Ok(())
 }
 
 async fn resolve_room(client: &Client, room: &str) -> Result<OwnedRoomId> {
@@ -410,11 +452,23 @@ async fn cmd_test(cfg: Config, store_path: PathBuf) -> Result<()> {
         cfg.user_id, cfg.device_id
     );
 
-    // Initial sync to fetch room state and learn membership.
-    client.sync_once(SyncSettings::default()).await?;
+    first_sync(&client).await?;
     let room_id = resolve_room(&client, &cfg.room).await?;
     println!("resolved room: {room_id}");
     let room = ensure_member(&client, &room_id).await?;
+
+    // Warn if the room has only the bot as a joined member: the probe
+    // message will be encrypted to nobody useful and "test ok" would be
+    // misleading. This is the canonical first-run failure mode (other
+    // invitees haven't accepted yet) and worth surfacing loudly.
+    let joined = room.joined_members_count();
+    if joined <= 1 {
+        eprintln!(
+            "warn: room {room_id} has only the bot user as a joined member. \
+             The probe message will not be decryptable for anyone until other \
+             members accept the invite and sync."
+        );
+    }
 
     if cfg.dry_run {
         println!("dry_run set; not posting probe.");
@@ -439,7 +493,7 @@ async fn cmd_now(cfg: Config, store_path: PathBuf) -> Result<()> {
     }
 
     let client = build_client(&cfg, &store_path).await?;
-    client.sync_once(SyncSettings::default()).await?;
+    first_sync(&client).await?;
     let room_id = resolve_room(&client, &cfg.room).await?;
     let room = ensure_member(&client, &room_id).await?;
     send_text(&room, &body, false).await?;
@@ -453,7 +507,7 @@ async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
         cfg.user_id, cfg.device_id
     );
 
-    client.sync_once(SyncSettings::default().full_state(true)).await?;
+    first_sync(&client).await?;
     let room_id = resolve_room(&client, &cfg.room).await?;
     let room = ensure_member(&client, &room_id).await?;
     eprintln!("posting to {room_id}");
