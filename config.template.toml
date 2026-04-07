@@ -1,0 +1,38 @@
+id = "{{instance_name}}"
+plugin = "faff-plugin-matrix-rust"
+
+# Matrix Authentication Service (MAS) compatible. The legacy /login endpoint
+# is NOT used. Obtain (user_id, device_id, access_token) out-of-band — see
+# README.md for the two supported paths (mas-cli or Element session).
+[connection]
+homeserver   = "https://matrix.datanauten.de"
+user_id      = "@yourbot:datanauten.de"
+device_id    = "ABCDEFGHIJ"
+# Either set access_token directly OR set access_token_env to the name of an
+# environment variable holding it (recommended — keeps it out of dotfiles).
+access_token = ""
+access_token_env = "FAFF_MATRIX_TOKEN"
+
+# Either an internal room id (!abcdef:server) or an alias (#room:server).
+# The room MUST already have the bot user as a member; this plugin will not
+# auto-join.
+room = "#faff-status:datanauten.de"
+
+[options]
+# Which transitions to announce: any subset of "start", "stop", "switch".
+notify_on = ["start", "stop", "switch"]
+
+# Post the current state once on startup (useful after restarts).
+announce_on_startup = false
+
+# Don't actually send to Matrix, just print what would be sent.
+dry_run = false
+
+# Templates use {key} placeholders. Available keys depend on the event:
+#   start  -> {title} {role} {impact} {mode} {subject} {trackers} {start_time}
+#   stop   -> the above plus {duration}
+#   switch -> the above plus {prev_title} {prev_duration}
+[options.templates]
+start  = "[faff] started: {title} ({start_time})"
+stop   = "[faff] stopped: {title} after {duration}"
+switch = "[faff] switched: {prev_title} -> {title}"

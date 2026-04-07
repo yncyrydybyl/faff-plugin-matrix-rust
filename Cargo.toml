@@ -1,0 +1,48 @@
+[package]
+name = "faff-plugin-matrix-rust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "AGPL-3.0"
+description = "A faff sidecar that posts the current faff to an end-to-end encrypted Matrix room (Rust port)."
+
+[[bin]]
+name = "faff-plugin-matrix-rust"
+path = "src/main.rs"
+
+[dependencies]
+# faff core (path dep — workspace member of ../faff-core)
+faff-core = { path = "../faff-core/core" }
+
+# Matrix client with E2EE.
+#
+# We pin to a git revision of matrix-rust-sdk rather than the 0.16 release
+# on crates.io because rustc 1.96.0-nightly trips a query-depth overflow
+# while computing the layout of the released Client::sync() future. main
+# typically carries a fix (or at least an internal #![recursion_limit] bump
+# in matrix-sdk's own crate root, which is the only place the attribute can
+# affect that compilation unit).
+matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", default-features = false, features = [
+    "e2e-encryption",
+    "sqlite",
+    # Statically link sqlite from source so the binary has no system C dep.
+    # Without this, linking fails on hosts that don't ship libsqlite3.
+    "bundled-sqlite",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Misc
+anyhow = "1"
+chrono = "0.4"
+chrono-tz = "0.8"
+dirs = "5"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
