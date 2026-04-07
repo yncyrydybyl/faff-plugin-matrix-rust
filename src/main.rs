@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -110,7 +110,7 @@ struct Templates {
 }
 
 impl Config {
-    fn load(path: &PathBuf) -> Result<Self> {
+    fn load(path: &Path) -> Result<Self> {
         let raw_str = fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         let raw: RawConfig = toml::from_str(&raw_str).context("parsing config TOML")?;
@@ -288,7 +288,7 @@ fn diff(
 // Matrix
 // ---------------------------------------------------------------------------
 
-async fn build_client(cfg: &Config, store_path: &PathBuf) -> Result<Client> {
+async fn build_client(cfg: &Config, store_path: &Path) -> Result<Client> {
     fs::create_dir_all(store_path)
         .with_context(|| format!("creating store dir {}", store_path.display()))?;
 
