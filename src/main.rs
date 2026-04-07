@@ -513,10 +513,25 @@ async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
     eprintln!("posting to {room_id}");
 
     // Background sync keeps Megolm sessions and member lists current.
+    // matrix-sdk's sync() returns on a non-recoverable error (network
+    // dropout, server restart, MAS rotated the token). When that
+    // happens we need to retry rather than silently giving up — the
+    // watcher loop above keeps emitting events that would otherwise
+    // all fail. Exponential backoff up to 60s.
     let bg_client = client.clone();
     let sync_handle = tokio::spawn(async move {
-        if let Err(e) = bg_client.sync(SyncSettings::default()).await {
-            eprintln!("warn: background sync stopped: {e}");
+        let mut backoff = std::time::Duration::from_secs(2);
+        loop {
+            match bg_client.sync(SyncSettings::default()).await {
+                Ok(()) => break,
+                Err(e) => {
+                    eprintln!(
+                        "warn: background sync stopped: {e}; retrying in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+                }
+            }
         }
     });
 
@@ -541,49 +556,67 @@ async fn cmd_run(cfg: Config, store_path: PathBuf) -> Result<()> {
     let mut rx = stream.subscribe();
     eprintln!("watching faff workspace for log changes...");
 
+    // Signal handlers for graceful shutdown. ctrl_c covers SIGINT;
+    // SignalKind::terminate covers SIGTERM (systemd 'stop'). We need
+    // both — without explicit handling, Ctrl-C kills the runtime
+    // before any cleanup runs and systemd's SIGTERM is ignored.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
+
     loop {
-        match rx.recv().await {
-            Ok(StorageEvent::LogChanged(_)) => {
-                let curr = match read_active_snapshot(&ws).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("warn: failed to read active session: {e}");
-                        continue;
-                    }
-                };
-                if let Some((kind, body)) =
-                    diff(prev.as_ref(), curr.as_ref(), ws.now(), &cfg.templates)
-                {
-                    if cfg.notify_on.contains(kind.name()) {
-                        if let Err(e) = send_text(&room, &body, cfg.dry_run).await {
-                            eprintln!("matrix post failed: {e}");
+        tokio::select! {
+            recv = rx.recv() => match recv {
+                Ok(StorageEvent::LogChanged(_)) => {
+                    let curr = match read_active_snapshot(&ws).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("warn: failed to read active session: {e}");
+                            continue;
+                        }
+                    };
+                    if let Some((kind, body)) =
+                        diff(prev.as_ref(), curr.as_ref(), ws.now(), &cfg.templates)
+                    {
+                        if cfg.notify_on.contains(kind.name()) {
+                            if let Err(e) = send_text(&room, &body, cfg.dry_run).await {
+                                eprintln!("matrix post failed: {e}");
+                            }
                         }
                     }
+                    prev = curr;
                 }
-                prev = curr;
+                Ok(StorageEvent::PlanChanged(_)) => { /* ignore */ }
+                Err(RecvError::Lagged(n)) => {
+                    eprintln!("warn: event stream lagged, dropped {n} events; resyncing state");
+                    // Don't propagate transient read errors here — that
+                    // would tear down the watcher on a hiccup. Match
+                    // the other read_active_snapshot call site.
+                    prev = match read_active_snapshot(&ws).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("warn: post-lag resync failed: {e}");
+                            continue;
+                        }
+                    };
+                }
+                Err(RecvError::Closed) => {
+                    eprintln!("event stream closed");
+                    break;
+                }
+            },
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("received SIGINT, shutting down");
+                break;
             }
-            Ok(StorageEvent::PlanChanged(_)) => { /* ignore */ }
-            Err(RecvError::Lagged(n)) => {
-                eprintln!("warn: event stream lagged, dropped {n} events; resyncing state");
-                // Don't propagate transient read errors here — that would
-                // tear down the watcher on a hiccup. Match the other
-                // read_active_snapshot call site and continue.
-                prev = match read_active_snapshot(&ws).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("warn: post-lag resync failed: {e}");
-                        continue;
-                    }
-                };
-            }
-            Err(RecvError::Closed) => {
-                eprintln!("event stream closed");
+            _ = sigterm.recv() => {
+                eprintln!("received SIGTERM, shutting down");
                 break;
             }
         }
     }
 
     sync_handle.abort();
+    let _ = sync_handle.await;
     Ok(())
 }
 
