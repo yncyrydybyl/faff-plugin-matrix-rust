@@ -45,11 +45,12 @@ use faff_core::Workspace;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
+    room::RoomMember,
     ruma::{
         events::room::message::RoomMessageEventContent, OwnedDeviceId, OwnedRoomId, OwnedUserId,
         RoomAliasId,
     },
-    Client, Room, SessionMeta, SessionTokens,
+    Client, Room, RoomMemberships, SessionMeta, SessionTokens,
 };
 
 // ---------------------------------------------------------------------------
@@ -380,7 +381,52 @@ async fn build_client(cfg: &Config, store_path: &Path) -> Result<Client> {
         }
     }
 
+    // Bootstrap cross-signing keys for the bot if they don't exist yet.
+    // Without this the bot's device shows in clients as "unverified",
+    // which is alarming even though decryption works fine. Once the bot
+    // has self-signing/master/user-signing keys uploaded, clients can
+    // see that the bot's device is signed by the bot's own master key,
+    // and a single one-time verification of @faff-bot's master key by
+    // a human user will trust every current and future bot device.
+    //
+    // Failure here is non-fatal: bot still sends/encrypts correctly,
+    // device just shows unverified until somebody verifies it manually.
+    bootstrap_cross_signing(&client).await;
+
     Ok(client)
+}
+
+/// Idempotent cross-signing setup. Logs and continues on failure
+/// rather than aborting startup — encryption still works.
+async fn bootstrap_cross_signing(client: &Client) {
+    let encryption = client.encryption();
+    match encryption.cross_signing_status().await {
+        Some(status) if status.is_complete() => {
+            tracing::debug!("cross-signing already set up for this device");
+            return;
+        }
+        Some(status) => {
+            tracing::info!(
+                "cross-signing partially set up (master={}, self_signing={}, user_signing={}); \
+                 (re)bootstrapping",
+                status.has_master,
+                status.has_self_signing,
+                status.has_user_signing,
+            );
+        }
+        None => {
+            tracing::info!("no cross-signing keys found; bootstrapping");
+        }
+    }
+    if let Err(e) = encryption.bootstrap_cross_signing(None).await {
+        tracing::warn!(
+            "cross-signing bootstrap failed: {e}. \
+             The bot device will appear unverified in clients until \
+             somebody verifies @faff-bot manually."
+        );
+    } else {
+        tracing::info!("cross-signing bootstrap complete");
+    }
 }
 
 /// Run the first sync from a fresh (or restored) crypto store.
@@ -469,12 +515,25 @@ async fn cmd_test(cfg: Config, store_path: PathBuf) -> Result<()> {
     // message will be encrypted to nobody useful and "test ok" would be
     // misleading. This is the canonical first-run failure mode (other
     // invitees haven't accepted yet) and worth surfacing loudly.
-    let joined = room.joined_members_count();
-    if joined <= 1 {
+    //
+    // Use Room::members(RoomMemberships::JOIN) rather than
+    // joined_members_count(): the latter reads from the cached room
+    // summary populated lazily from heroes, which is wildly out of
+    // date in fresh stores and produces false positives.
+    let joined: Vec<RoomMember> = room
+        .members(RoomMemberships::JOIN)
+        .await
+        .context("listing joined members")?;
+    let other_joined = joined.iter().filter(|m| m.user_id() != cfg.user_id).count();
+    if other_joined == 0 {
         tracing::warn!(
             "room {room_id} has only the bot user as a joined member. \
              The probe message will not be decryptable for anyone until other \
              members accept the invite and sync."
+        );
+    } else {
+        tracing::info!(
+            "room {room_id} has {other_joined} other joined member(s)"
         );
     }
 
